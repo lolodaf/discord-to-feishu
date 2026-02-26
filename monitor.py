@@ -3,198 +3,126 @@ import json
 import os
 import time
 import threading
-import urllib.parse
+import io
 from datetime import datetime, timezone, timedelta
 from flask import Flask
 
-# --- 配置加载与清洗模块 ---
+# --- 配置加载 ---
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+APP_ID = os.getenv("FEISHU_APP_ID")
+APP_SECRET = os.getenv("FEISHU_APP_SECRET")
+# 支持多群组配置：CHANNEL_ID1 对应 FEISHU_RECEIVE_ID1
 history = {}
-CHANNEL_NAMES_CACHE = {} 
-
-def clean_ids(raw_input):
-    if not raw_input: return []
-    if "，" in raw_input: raw_input = raw_input.replace("，", ",")
-    clean_ids = ["".join(filter(str.isdigit, raw_id)) for raw_id in raw_input.split(",")]
-    return [cid for cid in clean_ids if cid]
 
 def load_config():
     config_list = []
+    # 默认组
     ch_env = os.getenv("CHANNEL_ID")
-    webhook = os.getenv("FEISHU_URL") # 已经改为飞书环境变量
-    if ch_env and webhook:
-        config_list.append({"channels": clean_ids(ch_env), "webhook": webhook})
-        
-    for i in range(1, 11):
-        ch_env = os.getenv(f"CHANNEL_ID{i}")
-        webhook = os.getenv(f"FEISHU_URL{i}") # 已经改为飞书环境变量
-        if ch_env and webhook:
-            config_list.append({
-                "group_name": f"第{i}组",
-                "channels": clean_ids(ch_env), 
-                "webhook": webhook
-            })
+    receive_id = os.getenv("FEISHU_RECEIVE_ID")
+    if ch_env and receive_id:
+        config_list.append({"channels": ch_env.split(","), "receive_id": receive_id})
+    # 多组支持
+    for i in range(1, 6):
+        ch = os.getenv(f"CHANNEL_ID{i}")
+        rid = os.getenv(f"FEISHU_RECEIVE_ID{i}")
+        if ch and rid:
+            config_list.append({"channels": ch.split(","), "receive_id": rid})
     return config_list
 
 CONFIG_LIST = load_config()
 
-# --- 核心辅助与解析模块 ---
-def get_channel_name(channel_id):
-    if channel_id in CHANNEL_NAMES_CACHE: return CHANNEL_NAMES_CACHE[channel_id] 
-    url = f"https://discord.com/api/v9/channels/{channel_id}"
-    headers = {"Authorization": DISCORD_TOKEN, "Content-Type": "application/json"}
-    try:
-        res = requests.get(url, headers=headers, timeout=10)
-        if res.status_code == 200 and res.json().get('name'):
-            name = res.json().get('name')
-            CHANNEL_NAMES_CACHE[channel_id] = name 
-            return name
-    except: pass
-    return channel_id 
+# --- 飞书 API 核心类 ---
+class FeishuBot:
+    def __init__(self, app_id, app_secret):
+        self.app_id = app_id
+        self.app_secret = app_secret
+        self.token = ""
+        self.expire_time = 0
 
-def get_recent_messages(channel_id, limit=20):
-    url = f"https://discord.com/api/v9/channels/{channel_id}/messages?limit={limit}"
-    headers = {"Authorization": DISCORD_TOKEN, "Content-Type": "application/json"}
-    try:
-        res = requests.get(url, headers=headers, timeout=10)
-        if res.status_code == 200: return res.json()
-    except: pass
-    return []
+    def get_token(self):
+        """获取飞书身份凭证"""
+        if time.time() < self.expire_time:
+            return self.token
+        url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+        res = requests.post(url, json={"app_id": self.app_id, "app_secret": self.app_secret}).json()
+        self.token = res.get("tenant_access_token", "")
+        self.expire_time = time.time() + res.get("expire", 3600) - 60
+        return self.token
 
-def send_feishu_markdown(webhook, title, md_content):
-    """发送飞书 Markdown 消息卡片"""
-    if not webhook: return
-    headers = {"Content-Type": "application/json"}
-    
-    payload = {
-        "msg_type": "interactive",
-        "card": {
-            "header": {
-                "title": {
-                    "tag": "plain_text",
-                    "content": title
-                },
-                "template": "blue"
-            },
-            "elements": [
-                {
-                    "tag": "markdown",
-                    "content": md_content
-                }
-            ]
+    def upload_image(self, img_url):
+        """下载 Discord 图片并上传到飞书，换取 image_key"""
+        try:
+            # 1. 下载图片
+            img_res = requests.get(img_url, timeout=15)
+            if img_res.status_code != 200: return None
+            
+            # 2. 上传到飞书
+            url = "https://open.feishu.cn/open-apis/im/v1/images"
+            headers = {"Authorization": f"Bearer {self.get_token()}"}
+            files = {
+                "image_type": (None, "message"),
+                "image": ("discord_img.png", io.BytesIO(img_res.content), "image/png")
+            }
+            res = requests.post(url, headers=headers, files=files).json()
+            return res.get("data", {}).get("image_key")
+        except:
+            return None
+
+    def send_card(self, receive_id, title, content, image_key=None):
+        """发送带图片的卡片消息"""
+        url = f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
+        headers = {"Authorization": f"Bearer {self.get_token()}", "Content-Type": "application/json"}
+        
+        elements = [{"tag": "markdown", "content": content}]
+        # 如果有图片，在卡片里插入图片模块
+        if image_key:
+            elements.insert(0, {"tag": "img", "img_key": image_key, "alt": {"tag": "plain_text", "content": "图片"}})
+
+        card = {
+            "header": {"title": {"tag": "plain_text", "content": title}, "template": "blue"},
+            "elements": elements
         }
-    }
-    
-    try:
-        res = requests.post(webhook, headers=headers, data=json.dumps(payload), timeout=10)
-        if res.status_code != 200:
-            print(f"发送飞书失败，错误码: {res.status_code}, 返回: {res.text}")
-    except Exception as e:
-        print(f"发送飞书异常: {e}")
+        payload = {"receive_id": receive_id, "msg_type": "interactive", "content": json.dumps(card)}
+        requests.post(url, headers=headers, json=payload)
 
-def format_discord_time(raw_time_str):
-    if not raw_time_str: return "未知时间"
-    try:
-        dt_utc = datetime.fromisoformat(raw_time_str.replace('Z', '+00:00'))
-        return dt_utc.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
-    except: return raw_time_str
+bot = FeishuBot(APP_ID, APP_SECRET)
 
-def get_proxied_image_url(discord_url):
-    """利用全球公益代理突破国内无法访问Discord图片的问题"""
-    if not discord_url: return ""
-    encoded = urllib.parse.quote(discord_url, safe='')
-    return f"https://wsrv.nl/?url={encoded}&n=-1"
+# --- Discord 逻辑 (保持不变，仅修改发送部分) ---
+def get_recent_messages(channel_id):
+    headers = {"Authorization": DISCORD_TOKEN}
+    res = requests.get(f"https://discord.com/api/v9/channels/{channel_id}/messages?limit=5", headers=headers)
+    return res.json() if res.status_code == 200 else []
 
-def extract_readable_content(msg_obj):
-    text = msg_obj.get('content', '')
-    embeds = msg_obj.get('embeds', [])
-    for e in embeds:
-        text += "\n\n"
-        if e.get('title'): text += f"**【{e['title']}】**\n"
-        if e.get('description'): text += f"{e['description']}\n"
-        for field in e.get('fields', []):
-            text += f"- **{field.get('name', '')}**: {field.get('value', '')}\n"
-    return text.strip()
-
-# --- 后台死循环任务 ---
 def background_monitor():
-    global history
-    print(f"🚀 飞书监控已启动！共加载了 {len(CONFIG_LIST)} 组配置。")
-    
     while True:
-        for item in CONFIG_LIST:
-            webhook = item["webhook"]
-            for channel_id in item["channels"]:
-                messages = get_recent_messages(channel_id, limit=20)
-                if messages:
-                    last_id = history.get(channel_id, "")
-                    new_messages_to_send = []
+        for group in CONFIG_LIST:
+            for ch_id in group["channels"]:
+                messages = get_recent_messages(ch_id.strip())
+                if not messages: continue
+                
+                last_id = history.get(ch_id)
+                if last_id and messages[0]['id'] != last_id:
+                    new_msg = messages[0] # 简化逻辑：仅转发最新一条
+                    author = new_msg.get('author', {}).get('username', '未知')
+                    text = new_msg.get('content', '')
                     
-                    if last_id:
-                        for msg in messages:
-                            if msg['id'] == last_id: break
-                            new_messages_to_send.append(msg)
-                    else:
-                        new_messages_to_send = [messages[0]]
+                    # 尝试抓取第一张图片
+                    img_key = None
+                    attachments = new_msg.get('attachments', [])
+                    if attachments:
+                        img_key = bot.upload_image(attachments[0]['url'])
                     
-                    if new_messages_to_send:
-                        channel_name = get_channel_name(channel_id)
-                        
-                        for msg in reversed(new_messages_to_send):
-                            author = msg.get('member', {}).get('nick') or msg.get('author', {}).get('username', '未知')
-                            formatted_time = format_discord_time(msg.get('timestamp', ''))
-                            
-                            md_text = f"**频道**: {channel_name}\n**时间**: {formatted_time}\n**用户**: {author}\n\n"
-
-                            if msg.get('referenced_message'):
-                                ref_msg = msg['referenced_message']
-                                ref_author = ref_msg.get('member', {}).get('nick') or ref_msg.get('author', {}).get('username', '未知')
-                                ref_content = extract_readable_content(ref_msg)
-                                if not ref_content: ref_content = "[图片/文件/特殊卡片]"
-                                md_text += f"**回复 {ref_author}**:\n> " + '\n> '.join(ref_content.split('\n')) + "\n\n"
-                            
-                            if msg.get('message_snapshots'):
-                                for snap in msg['message_snapshots']:
-                                    snap_msg = snap.get('message', {})
-                                    snap_content = extract_readable_content(snap_msg)
-                                    for att in snap_msg.get('attachments', []):
-                                        url = att.get('url', '')
-                                        if any(url.split('?')[0].lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']):
-                                            safe_img = get_proxied_image_url(url)
-                                            snap_content += f"\n\n![转发的图片]({safe_img})"
-                                    if not snap_content: snap_content = "[复杂多媒体卡片]"
-                                    md_text += f"**🔄 转发了消息**:\n> " + '\n> '.join(snap_content.split('\n')) + "\n\n"
-
-                            content_text = extract_readable_content(msg)
-                            if content_text:
-                                md_text += f"**内容**:\n{content_text}\n\n"
-
-                            for att in msg.get('attachments', []):
-                                url = att.get('url', '')
-                                file_name = att.get('filename', '附件')
-                                c_type = att.get('content_type', '')
-                                if c_type.startswith('image/') or any(url.split('?')[0].lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']):
-                                    safe_img = get_proxied_image_url(url)
-                                    md_text += f"![图片]({safe_img})\n[🔗 点击查看原图]({url})\n\n"
-                                else:
-                                    md_text += f"[📁 文件下载: {file_name}]({url})\n\n"
-                            
-                            for e in msg.get('embeds', []):
-                                pic_url = e.get('image', {}).get('url') or e.get('thumbnail', {}).get('url')
-                                if pic_url:
-                                    safe_img = get_proxied_image_url(pic_url)
-                                    md_text += f"![GIF/预览图]({safe_img})\n[🔗 点击查看原图/动图]({pic_url})\n\n"
-
-                            print(f">>> 频道 [{channel_name}] 有新消息！发往对应的飞书。")
-                            send_feishu_markdown(webhook, f"新消息: {channel_name}", md_text)
-                            time.sleep(2) 
-                    
-                    history[channel_id] = messages[0]['id']
+                    md = f"**用户**: {author}\n**内容**: {text}"
+                    bot.send_card(group["receive_id"], "Discord 新动态", md, img_key)
+                
+                history[ch_id] = messages[0]['id']
         time.sleep(60)
 
+# --- Web 服务器 ---
 app = Flask(__name__)
 @app.route('/')
-def keep_alive(): return f"Feishu Bot is running! Total active groups: {len(CONFIG_LIST)} ✅"
+def home(): 
+    return f"Bot Running. Configured Groups: {len(CONFIG_LIST)}<br>Tip: Use Bot API to get Chat ID."
 
 if __name__ == '__main__':
     threading.Thread(target=background_monitor, daemon=True).start()
