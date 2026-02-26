@@ -7,19 +7,18 @@ import io
 from datetime import datetime, timezone, timedelta
 from flask import Flask
 
-# --- 1. 配置加载 ---
+# --- 1. 配置与初始化 ---
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 APP_ID = os.getenv("FEISHU_APP_ID")
 APP_SECRET = os.getenv("FEISHU_APP_SECRET")
 history = {}
+CHANNEL_NAMES_CACHE = {} 
 
 def load_config():
-    """根据你的截图逻辑，匹配 CHANNEL_IDx 和 FEISHU_RECEIVE_IDx"""
+    """读取多组配置：CHANNEL_ID1 -> FEISHU_RECEIVE_ID1 ..."""
     config_list = []
-    # 循环读取 1-10 组配置
     for i in range(1, 11):
         ch = os.getenv(f"CHANNEL_ID{i}")
-        # 注意：这里改读 RECEIVE_ID，用来对应不同的群
         rid = os.getenv(f"FEISHU_RECEIVE_ID{i}")
         if ch and rid:
             clean_channels = [c.strip() for c in ch.split(",") if c.strip()]
@@ -28,8 +27,31 @@ def load_config():
 
 CONFIG_LIST = load_config()
 
-# --- 2. 飞书高级 API 类 ---
-class FeishuAdvancedBot:
+# --- 2. 核心辅助工具 ---
+def get_channel_name(channel_id):
+    """获取 Discord 频道名称并缓存"""
+    if channel_id in CHANNEL_NAMES_CACHE: return CHANNEL_NAMES_CACHE[channel_id] 
+    url = f"https://discord.com/api/v9/channels/{channel_id}"
+    headers = {"Authorization": DISCORD_TOKEN}
+    try:
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code == 200:
+            name = res.json().get('name', channel_id)
+            CHANNEL_NAMES_CACHE[channel_id] = name 
+            return name
+    except: pass
+    return channel_id 
+
+def format_discord_time(raw_time_str):
+    """将 Discord 时间转为北京时间格式"""
+    if not raw_time_str: return "未知时间"
+    try:
+        dt_utc = datetime.fromisoformat(raw_time_str.replace('Z', '+00:00'))
+        return dt_utc.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+    except: return raw_time_str
+
+# --- 3. 飞书 API 类 ---
+class FeishuBot:
     def __init__(self, app_id, app_secret):
         self.app_id = app_id
         self.app_secret = app_secret
@@ -45,7 +67,6 @@ class FeishuAdvancedBot:
         return self.token
 
     def upload_image(self, img_url):
-        """核心：下载 Discord 图片并上传到飞书，换取能够显示的 image_key"""
         try:
             img_res = requests.get(img_url, timeout=15)
             if img_res.status_code != 200: return None
@@ -53,73 +74,73 @@ class FeishuAdvancedBot:
             headers = {"Authorization": f"Bearer {self.get_token()}"}
             files = {
                 "image_type": (None, "message"),
-                "image": ("discord_img.png", io.BytesIO(img_res.content), "image/png")
+                "image": ("img.png", io.BytesIO(img_res.content), "image/png")
             }
             res = requests.post(url, headers=headers, files=files).json()
             return res.get("data", {}).get("image_key")
         except: return None
 
     def send_card(self, receive_id, title, content, image_key=None):
-        """发送带缩略图的交互式卡片"""
         url = f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
         headers = {"Authorization": f"Bearer {self.get_token()}", "Content-Type": "application/json"}
-        
         elements = [{"tag": "markdown", "content": content}]
-        # 如果有图片，将图片模块插入到卡片最上方
         if image_key:
-            elements.insert(0, {"tag": "img", "img_key": image_key, "alt": {"tag": "plain_text", "content": "图片"}})
-
+            elements.insert(0, {"tag": "img", "img_key": image_key, "alt": {"tag": "plain_text", "content": "img"}})
         card = {
             "header": {"title": {"tag": "plain_text", "content": title}, "template": "blue"},
             "elements": elements
         }
-        payload = {"receive_id": receive_id, "msg_type": "interactive", "content": json.dumps(card)}
-        requests.post(url, headers=headers, json=payload)
+        requests.post(url, headers=headers, json={"receive_id": receive_id, "msg_type": "interactive", "content": json.dumps(card)})
 
-feishu_bot = FeishuAdvancedBot(APP_ID, APP_SECRET)
+bot = FeishuBot(APP_ID, APP_SECRET)
 
-# --- 3. 监控与转发逻辑 ---
-def get_recent_messages(channel_id):
-    headers = {"Authorization": DISCORD_TOKEN}
-    try:
-        res = requests.get(f"https://discord.com/api/v9/channels/{channel_id}/messages?limit=10", headers=headers, timeout=10)
-        return res.json() if res.status_code == 200 else []
-    except: return []
-
+# --- 4. 监控主循环 ---
 def background_monitor():
-    print(f"🚀 高级缩略图版监控启动！加载了 {len(CONFIG_LIST)} 组对应关系。")
+    print(f"🚀 格式优化版监控启动！")
     while True:
         for group in CONFIG_LIST:
-            target_chat_id = group["receive_id"]
+            target_id = group["receive_id"]
             for ch_id in group["channels"]:
-                messages = get_recent_messages(ch_id)
-                if not messages: continue
+                try:
+                    res = requests.get(f"https://discord.com/api/v9/channels/{ch_id}/messages?limit=10", headers={"Authorization": DISCORD_TOKEN}, timeout=10)
+                    messages = res.json() if res.status_code == 200 else []
+                except: continue
                 
+                if not messages: continue
                 last_id = history.get(ch_id)
                 if last_id:
                     new_msgs = [m for m in messages if m['id'] > last_id]
                     for msg in reversed(new_msgs):
+                        # 获取数据
+                        channel_name = get_channel_name(ch_id)
+                        formatted_time = format_discord_time(msg.get('timestamp', ''))
                         author = msg.get('author', {}).get('username', '未知')
-                        content = msg.get('content', '') or "[多媒体消息]"
+                        content = msg.get('content', '') or "[多媒体内容]"
                         
-                        # 处理图片缩略图
+                        # 图片处理
                         img_key = None
-                        attachments = msg.get('attachments', [])
-                        if attachments and any(attachments[0]['url'].lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif']):
-                            print(f"正在处理图片上传: {attachments[0]['url']}")
-                            img_key = feishu_bot.upload_image(attachments[0]['url'])
+                        atts = msg.get('attachments', [])
+                        if atts and any(atts[0]['url'].lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif']):
+                            img_key = bot.upload_image(atts[0]['url'])
                         
-                        md_text = f"**发送者**: {author}\n**内容**: {content}"
-                        feishu_bot.send_card(target_chat_id, "Discord 实时监控", md_text, img_key)
-                        time.sleep(1) # 避开频率限制
+                        # 🎯 按照你要求的格式排版
+                        md = (
+                            f"频道: {channel_name}\n"
+                            f"时间: {formatted_time}\n"
+                            f"用户: {author}\n\n"
+                            f"内容: {content}"
+                        )
+                        
+                        bot.send_card(target_id, f"新消息: {channel_name}", md, img_key)
+                        time.sleep(1)
                 
                 history[ch_id] = messages[0]['id']
         time.sleep(60)
 
-# --- 4. 服务入口 ---
+# --- 5. Flask 入口 ---
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Advanced Feishu Bot is running! ✅"
+def home(): return f"Bot Running! Configured Groups: {len(CONFIG_LIST)}"
 
 if __name__ == '__main__':
     threading.Thread(target=background_monitor, daemon=True).start()
